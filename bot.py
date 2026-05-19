@@ -362,7 +362,7 @@ def dashboard_msg():
     for sym, cfg in SYMBOLS.items():
         t = fetch_ticker(sym)
         e = "🟢" if t["change"] >= 0 else "🔴"
-        lines += f"│ {cfg['name'][:2]} {e} ${t['price']:>8,.2f} {t['change']:>+6.1f}% │\n"
+        lines += f"│ {cfg['name']} {e} ${t['price']:>8,.2f} {t['change']:>+6.1f}% │\n"
     
     open_t = [t for t in trades_db if t.get("status") == "open"]
     closed_t = [t for t in trades_db if t.get("status") == "closed"]
