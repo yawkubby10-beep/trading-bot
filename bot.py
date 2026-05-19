@@ -112,9 +112,41 @@ def fetch_klines(symbol, interval, limit=100):
 
 def fetch_ticker(symbol):
     try:
+        # Try Binance first
         r = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}", timeout=10)
         d = r.json()
         return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]), "volume": float(d["quoteVolume"])}
+    except:
+        pass
+    
+    # Fallback to Binance US
+    try:
+        r = requests.get(f"https://api.binance.us/api/v3/ticker/24hr?symbol={symbol}", timeout=10)
+        d = r.json()
+        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]), "volume": float(d["quoteVolume"])}
+    except:
+        pass
+    
+    # Fallback to KuCoin
+    try:
+        kc_symbol = symbol.replace("USDT", "-USDT")
+        r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={kc_symbol}", timeout=10)
+        d = r.json()
+        price = float(d["data"]["price"])
+        r2 = requests.get(f"https://api.kucoin.com/api/v1/market/stats?symbol={kc_symbol}", timeout=10)
+        d2 = r2.json()
+        change = float(d2["data"]["changeRate"]) * 100
+        return {"price": price, "change": change, "volume": 0}
+    except:
+        pass
+    
+    # Last resort - CoinGecko
+    try:
+        cg_ids = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana", "BNBUSDT": "binancecoin"}
+        cg_id = cg_ids.get(symbol, "bitcoin")
+        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd&include_24hr_change=true", timeout=10)
+        d = r.json()
+        return {"price": float(d[cg_id]["usd"]), "change": float(d[cg_id]["usd_24h_change"]), "volume": 0}
     except:
         return {"price": 0, "change": 0, "volume": 0}
 
