@@ -1,19 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   INSTITUTIONAL TRADING BOT v9.5 - RENDER DEPLOYMENT    ║
-║   Multi-Timeframe SMC + AI Regime + Risk Engine         ║
-║   BTC | ETH | SOL | BNB Perpetual Futures               ║
+║   INSTITUTIONAL TRADING BOT v9.5 - AUTO SCAN           ║
+║   Multi-TF SMC + Kelly + Auto Signal Alerts            ║
+║   24/7 Market Scanning Every 5 Minutes                 ║
 ╚══════════════════════════════════════════════════════════╝
 """
-import os, json, logging, time, threading
+import os, json, logging, time, threading, asyncio
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from enum import Enum
 import numpy as np
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 import requests
@@ -30,6 +29,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "100"))
+AUTO_SCAN_INTERVAL = 300  # 5 minutes
 
 SYMBOLS = {
     "BTCUSDT": {"name": "₿ Bitcoin", "min_volume": 500_000_000, "atr_mult": 2.0, "rr_min": 2.5},
@@ -48,11 +48,14 @@ class Regime(Enum):
     VOLATILE = "volatile_expansion"
 
 # ═══════════════════════════════════════
-# DATA STORAGE (in-memory for Render)
+# STORAGE (in-memory for Render)
 # ═══════════════════════════════════════
 
 trades_db = []
 account_db = {"equity": STARTING_BALANCE, "daily_trades": 0, "consecutive_losses": 0, "last_reset": datetime.utcnow().strftime("%Y-%m-%d")}
+last_scan_time = None
+last_signals = []
+bot_instance = None  # Global bot reference for sending messages
 
 # ═══════════════════════════════════════
 # RISK ENGINE
@@ -95,7 +98,7 @@ class RiskEngine:
         return True, "✅"
 
 # ═══════════════════════════════════════
-# MARKET DATA
+# MARKET DATA WITH FALLBACKS
 # ═══════════════════════════════════════
 
 def fetch_klines(symbol, interval, limit=100):
@@ -111,38 +114,21 @@ def fetch_klines(symbol, interval, limit=100):
         return pd.DataFrame()
 
 def fetch_ticker(symbol):
-    try:
-        # Try Binance first
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}", timeout=10)
-        d = r.json()
-        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]), "volume": float(d["quoteVolume"])}
-    except:
-        pass
+    # Try multiple APIs
+    for api in [
+        f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}",
+        f"https://api.binance.us/api/v3/ticker/24hr?symbol={symbol}",
+    ]:
+        try:
+            r = requests.get(api, timeout=10)
+            d = r.json()
+            return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]), "volume": float(d["quoteVolume"])}
+        except:
+            continue
     
-    # Fallback to Binance US
+    # CoinGecko fallback
+    cg_ids = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana", "BNBUSDT": "binancecoin"}
     try:
-        r = requests.get(f"https://api.binance.us/api/v3/ticker/24hr?symbol={symbol}", timeout=10)
-        d = r.json()
-        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]), "volume": float(d["quoteVolume"])}
-    except:
-        pass
-    
-    # Fallback to KuCoin
-    try:
-        kc_symbol = symbol.replace("USDT", "-USDT")
-        r = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={kc_symbol}", timeout=10)
-        d = r.json()
-        price = float(d["data"]["price"])
-        r2 = requests.get(f"https://api.kucoin.com/api/v1/market/stats?symbol={kc_symbol}", timeout=10)
-        d2 = r2.json()
-        change = float(d2["data"]["changeRate"]) * 100
-        return {"price": price, "change": change, "volume": 0}
-    except:
-        pass
-    
-    # Last resort - CoinGecko
-    try:
-        cg_ids = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana", "BNBUSDT": "binancecoin"}
         cg_id = cg_ids.get(symbol, "bitcoin")
         r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd&include_24hr_change=true", timeout=10)
         d = r.json()
@@ -187,7 +173,6 @@ def detect_structure(df_4h, df_1h, df_15m):
     ema50_4h = calc_ema(df_4h, 50)[-1]
     ema21_1h = calc_ema(df_1h, 21)[-1]
     ema21_15m = calc_ema(df_15m, 21)[-1]
-    
     return {
         "htf_bullish": ema21_4h > ema50_4h,
         "htf_bearish": ema21_4h < ema50_4h,
@@ -252,9 +237,11 @@ def analyze(symbol):
     volume = ticker["volume"]
     config = SYMBOLS.get(symbol, SYMBOLS["BTCUSDT"])
     
-    if volume < config["min_volume"]: return None
+    if volume < config["min_volume"] and volume > 0: return None
     
     regime = detect_regime(df_4h, df_1h)
+    if regime is None: return None
+    
     structure = detect_structure(df_4h, df_1h, df_15m)
     rsi = calc_rsi(df_1h, 14)
     macd = calc_macd(df_1h)
@@ -273,7 +260,7 @@ def analyze(symbol):
             if macd["bullish"]: confidence += 10; reasons.append("MACD bullish")
             if change > 0: confidence += 5
             if regime == Regime.STRONG_TREND_UP: confidence += 10
-            elif regime == Regime.COMPRESSION: confidence += 5; reasons.append("Breakout potential")
+            elif regime == Regime.COMPRESSION: confidence += 5; reasons.append("Breakout setup")
     
     elif regime in [Regime.STRONG_TREND_DOWN, Regime.WEAK_TREND_DOWN]:
         if structure["htf_bearish"] and structure["mtf_bearish"]:
@@ -304,7 +291,6 @@ def analyze(symbol):
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     rr = reward / risk if risk > 0 else 0
-    
     if rr < config["rr_min"]: return None
     
     volatility = atr / entry * 100
@@ -323,6 +309,74 @@ def scan_all():
     signals = [s for s in [analyze(sym) for sym in SYMBOLS] if s]
     signals.sort(key=lambda x: x["confidence"], reverse=True)
     return signals
+
+# ═══════════════════════════════════════
+# AUTO SCANNER
+# ═══════════════════════════════════════
+
+def format_signal_alert(signal):
+    emoji = "🟢 BUY" if signal["direction"] == "long" else "🔴 SELL"
+    stars = "⭐" * min(5, int(signal["confidence"] / 20))
+    return f"""
+🔔 *AUTO SIGNAL ALERT*
+
+{emoji} {signal['name']} {stars}
+━━━━━━━━━━━━━━━━━━
+💰 Entry: ${signal['entry']:,.2f}
+🛑 Stop: ${signal['stop_loss']:,.2f}
+🎯 Target: ${signal['take_profit']:,.2f}
+📊 R:R: {signal['risk_reward']}x | Conf: {signal['confidence']:.0f}%
+📈 24h: {signal['change']:+.2f}%
+
+💡 {', '.join(signal['reasons'][:2])}
+Regime: {signal['regime'].replace('_',' ').title()}
+"""
+
+def auto_scan_loop():
+    global last_scan_time, last_signals, bot_instance
+    logger.info("🔍 Auto-scanner started (every 5 minutes)")
+    
+    while True:
+        try:
+            logger.info("🔍 Auto-scanning markets...")
+            signals = scan_all()
+            last_scan_time = datetime.utcnow()
+            
+            if signals and bot_instance:
+                # Check if we have new high-confidence signals
+                for signal in signals[:3]:  # Top 3 signals
+                    if signal["confidence"] >= 75:  # Only alert on high confidence
+                        # Check if this is a new signal
+                        is_new = True
+                        for old in last_signals:
+                            if old["symbol"] == signal["symbol"] and old["direction"] == signal["direction"]:
+                                if abs(old["confidence"] - signal["confidence"]) < 5:
+                                    is_new = False
+                        
+                        if is_new:
+                            try:
+                                msg = format_signal_alert(signal)
+                                keyboard = InlineKeyboardMarkup([[
+                                    InlineKeyboardButton(f"✅ Execute {signal['direction'].upper()}", 
+                                        callback_data=f"exec_{signal['direction']}_{signal['symbol']}"),
+                                    InlineKeyboardButton("❌ Dismiss", callback_data="dashboard")
+                                ]])
+                                bot_instance.send_message(
+                                    chat_id=ADMIN_ID,
+                                    text=msg,
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=keyboard
+                                )
+                                logger.info(f"Alert sent: {signal['symbol']} {signal['direction']}")
+                            except Exception as e:
+                                logger.error(f"Alert send error: {e}")
+            
+            last_signals = signals
+            
+        except Exception as e:
+            logger.error(f"Auto-scan error: {e}")
+        
+        time.sleep(AUTO_SCAN_INTERVAL)
 
 # ═══════════════════════════════════════
 # POSITION MONITOR
@@ -360,6 +414,19 @@ def check_exits():
             trade["pnl"] = round(pnl, 2)
             account_db["equity"] = account_db.get("equity", STARTING_BALANCE) + pnl
             account_db["consecutive_losses"] = 0 if pnl > 0 else account_db.get("consecutive_losses", 0) + 1
+            
+            # Send alert
+            if bot_instance:
+                try:
+                    emoji = "🟢" if pnl > 0 else "🔴"
+                    bot_instance.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"{emoji} *Position Closed*\n\n{trade['symbol']} {trade['direction'].upper()}\nExit: {reason} @ ${cp:,.2f}\nP&L: ${pnl:,.2f}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except:
+                    pass
+            
             logger.info(f"Trade {trade['trade_id']} closed: {reason} | P&L: ${pnl:.2f}")
 
 def monitor_loop():
@@ -377,7 +444,7 @@ def monitor_loop():
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 Scan ALL", callback_data="scan_all"),
+        [InlineKeyboardButton("🎯 Scan Now", callback_data="scan_all"),
          InlineKeyboardButton("📊 Dashboard", callback_data="dashboard")],
         [InlineKeyboardButton("₿ BTC", callback_data="scan_BTCUSDT"),
          InlineKeyboardButton("Ξ ETH", callback_data="scan_ETHUSDT")],
@@ -386,7 +453,7 @@ def main_keyboard():
         [InlineKeyboardButton("💼 Positions", callback_data="pos"),
          InlineKeyboardButton("📈 Stats", callback_data="stats")],
         [InlineKeyboardButton("🛡 Risk", callback_data="risk"),
-         InlineKeyboardButton("❓ Help", callback_data="help")]
+         InlineKeyboardButton("ℹ️ Status", callback_data="status")]
     ])
 
 def dashboard_msg():
@@ -403,6 +470,8 @@ def dashboard_msg():
     pnl_e = "🟢" if total_pnl >= 0 else "🔴"
     
     pos_text = "📭 None" if not open_t else "\n".join(f"• {'📈 L' if t['direction']=='long' else '📉 S'} {t['symbol']} @ ${t['entry_price']:,.2f}" for t in open_t[:5])
+    
+    last_scan = last_scan_time.strftime('%H:%M UTC') if last_scan_time else "Never"
     
     return f"""
 ╔══════════════════════════╗
@@ -425,22 +494,23 @@ def dashboard_msg():
 💼 POSITIONS ({len(open_t)})
 {pos_text}
 
-🛡 RISK | Trades: {account_db.get('daily_trades',0)}/10 | WR: {len(wins)}/{max(len(closed_t),1)}
+🛡 RISK | Trades: {account_db.get('daily_trades',0)}/10 | WR: {len(wins)}/{max(len(closed_t),1)} ({len(wins)/max(len(closed_t),1)*100:.0f}%)
+🔍 Last Scan: {last_scan}
 {'━' * 26}
-✅ v9.5 Cloud | Auto SL/TP | Multi-TF
+✅ v9.5 | Auto-Scan 5min | SL/TP Active
 """
 
 # ═══════════════════════════════════════
 # HANDLERS
 # ═══════════════════════════════════════
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_ID:
         await update.message.reply_text("🔒 Unauthorized")
         return
     await update.message.reply_text(dashboard_msg(), parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
@@ -449,10 +519,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(dashboard_msg(), parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
     
     elif d == "scan_all":
-        await q.message.edit_text("🔍 *Multi-TF Analysis...*\n\n4H → 1H → 15M → 5M\nEMA · RSI · MACD · ATR · SMC", parse_mode=ParseMode.MARKDOWN)
+        await q.message.edit_text("🔍 *Running Multi-TF Analysis...*\n\nScanning all coins...", parse_mode=ParseMode.MARKDOWN)
         signals = scan_all()
         if signals:
-            msg = f"🎯 *SIGNALS* ({len(signals)} found)\n\n"
+            msg = f"🎯 *SIGNALS FOUND* ({len(signals)})\n\n"
             for i, s in enumerate(signals[:5]):
                 stars = "⭐" * min(5, int(s["confidence"]/20))
                 dr = "🟢 LONG" if s["direction"]=="long" else "🔴 SHORT"
@@ -465,7 +535,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      InlineKeyboardButton("🏠 Dashboard", callback_data="dashboard")]
                 ]))
         else:
-            await q.message.edit_text("🔍 *No signals*\n\nAll coins analyzed. No setups meet 60% confidence.", parse_mode=ParseMode.MARKDOWN,
+            await q.message.edit_text("🔍 *No signals*\n\nAll coins below 60% confidence.", parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔄 Rescan", callback_data="scan_all"),
                     InlineKeyboardButton("🏠 Dashboard", callback_data="dashboard")
@@ -473,7 +543,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif d.startswith("scan_"):
         sym = d.replace("scan_", "")
-        await q.message.edit_text(f"🔍 *Analyzing {SYMBOLS[sym]['name']}...*\n\nMulti-TF + SMC + Regime", parse_mode=ParseMode.MARKDOWN)
+        await q.message.edit_text(f"🔍 *Analyzing {SYMBOLS[sym]['name']}...*", parse_mode=ParseMode.MARKDOWN)
         s = analyze(sym)
         if s:
             em = "🟢 BUY" if s["direction"]=="long" else "🔴 SELL"
@@ -491,10 +561,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ║ 🎯 Conf:   {s['confidence']:>8.0f}% ║
 ╚══════════════════════╝
 
-📊 *Analysis:*
-• Regime: {s['regime'].replace('_',' ').title()}
-• RSI: {s['rsi']} | Size: ${s['position_size']:,.0f}
-• {', '.join(s['reasons'][:3])}
+📊 {s['regime'].replace('_',' ').title()} | RSI {s['rsi']}
+💡 {', '.join(s['reasons'][:3])}
 """
             await q.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([
@@ -504,7 +572,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]))
         else:
             t = fetch_ticker(sym)
-            await q.message.edit_text(f"🔍 No signal for {SYMBOLS[sym]['name']}\nPrice: ${t['price']:,.2f}\n24h: {t['change']:+.2f}%\n\nConfidence < 60%", parse_mode=ParseMode.MARKDOWN,
+            await q.message.edit_text(f"🔍 No signal for {SYMBOLS[sym]['name']}\nPrice: ${t['price']:,.2f}\n24h: {t['change']:+.2f}%\n\nBelow 60% confidence", parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔄 Scan All", callback_data="scan_all"),
                     InlineKeyboardButton("🏠 Dashboard", callback_data="dashboard")
@@ -541,7 +609,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 by_sym[sym]["t"] += 1
                 by_sym[sym]["p"] += t.get("pnl",0)
                 if t.get("pnl",0) > 0: by_sym[sym]["w"] += 1
-            msg = f"📈 *STATS*\n\nTotal: {len(closed)} | Wins: {len(wins)} | WR: {len(wins)/len(closed)*100:.0f}%\nP&L: ${tp:,.2f}\n\n*By Coin:*\n"
+            msg = f"📈 *STATS*\n\nTotal: {len(closed)} | Wins: {len(wins)}\nWR: {len(wins)/len(closed)*100:.0f}% | P&L: ${tp:,.2f}\n\n*By Coin:*\n"
             for sym, st in by_sym.items():
                 msg += f"• {sym}: {st['w']}/{st['t']} | ${st['p']:,.2f}\n"
             await q.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN,
@@ -552,26 +620,30 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "risk":
         allowed, reason = RiskEngine.check_limits()
         status = "🟢 HEALTHY" if allowed else "🔴 BLOCKED"
-        msg = f"🛡 *RISK: {status}*\n\n{reason}\nEquity: ${account_db.get('equity',0):,.2f}\nTrades: {account_db.get('daily_trades',0)}/10\nLosses: {account_db.get('consecutive_losses',0)}/3\n\nLimits: 3% DD | 3 losses | 3 pos | Kelly sizing"
+        msg = f"🛡 *RISK: {status}*\n\n{reason}\nEquity: ${account_db.get('equity',0):,.2f}\nTrades: {account_db.get('daily_trades',0)}/10\nLosses: {account_db.get('consecutive_losses',0)}/3"
         await q.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Dashboard", callback_data="dashboard")
             ]]))
     
-    elif d == "help":
-        await q.message.edit_text("""
-❓ *v9.5 FEATURES*
+    elif d == "status":
+        last = last_scan_time.strftime('%H:%M:%S UTC') if last_scan_time else "Never"
+        sig_count = len(last_signals)
+        open_count = len([t for t in trades_db if t.get("status")=="open"])
+        msg = f"""
+ℹ️ *SYSTEM STATUS*
 
-• Multi-Timeframe (4H/1H/15M/5M)
-• EMA · RSI · MACD · ATR
-• 7 Market Regimes
-• SMC: Liquidity Levels
-• Kelly Position Sizing
-• Auto SL/TP + Trailing
-• 30s Position Monitor
-
-⚠️ Paper Trading | 24/7 Cloud
-""", parse_mode=ParseMode.MARKDOWN,
+🟢 Bot: Running
+🔍 Auto-Scan: Every 5min
+🕐 Last Scan: {last}
+🎯 Signals Found: {sig_count}
+💼 Open Positions: {open_count}
+🛡 Monitor: Active (30s)
+💰 Equity: ${account_db.get('equity',0):,.2f}
+🌐 Host: Render Cloud
+⏰ Uptime: 24/7
+"""
+        await q.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Dashboard", callback_data="dashboard")
             ]]))
@@ -587,7 +659,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         s = analyze(sym)
         if not s:
-            await q.message.edit_text("⚠️ Signal expired", parse_mode=ParseMode.MARKDOWN)
+            await q.message.edit_text("⚠️ Signal expired. Rescan.", parse_mode=ParseMode.MARKDOWN)
             return
         
         trade = {
@@ -612,6 +684,7 @@ Size: ${s['position_size']:,.0f}
 R:R: {s['risk_reward']}x | Conf: {s['confidence']:.0f}%
 
 🛡 Auto SL/TP + Trailing Active
+🔍 Auto-scan continues every 5min
 """
         await q.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
@@ -623,23 +696,36 @@ R:R: {s['risk_reward']}x | Conf: {s['confidence']:.0f}%
 # ═══════════════════════════════════════
 
 def main():
+    global bot_instance
+    
     print("""
 ╔══════════════════════════════════════╗
-║  TRADING BOT v9.5 - RENDER CLOUD   ║
-║  Multi-TF SMC + Kelly + Auto SL/TP ║
+║  TRADING BOT v9.5 - AUTO SCAN      ║
+║  24/7 Market Monitoring            ║
+║  Alerts Every 5 Minutes            ║
 ╚══════════════════════════════════════╝
 """)
     
-    # Start position monitor in background
-    monitor = threading.Thread(target=monitor_loop, daemon=True)
-    monitor.start()
+    if not BOT_TOKEN or ADMIN_ID == 0:
+        print("❌ Missing config!")
+        return
+    
+    # Start monitors
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=auto_scan_loop, daemon=True).start()
     
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).build()
-    app.add_handler(CommandHandler(["start", "dashboard"], start))
-    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(CommandHandler(["start", "dashboard"], cmd_start))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
     
-    print("✅ Bot RUNNING | 🛡 Monitor Active | 30s Checks")
-    print(f"📱 Telegram: /start | 💰 ${STARTING_BALANCE:.0f} Paper")
+    # Store bot instance for alerts
+    bot_instance = app.bot
+    
+    print("✅ Bot RUNNING!")
+    print("🔍 Auto-Scan: Every 5 minutes")
+    print("🛡 Position Monitor: Every 30 seconds")
+    print("📱 Telegram: /start")
+    print(f"💰 Balance: ${STARTING_BALANCE:.0f}")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
